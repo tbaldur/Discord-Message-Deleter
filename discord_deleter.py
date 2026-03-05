@@ -9,13 +9,29 @@ from pathlib import Path
 import requests
 
 PACKAGE_PATH = Path(__file__).parent / "package"
+DELETED_FILE = Path(__file__).parent / "deleted.json"
 API_BASE = "https://discord.com/api/v9"
 DELETE_DELAY = 1.4  # seconds between deletes
+
+
+def load_deleted():
+    """Load set of already-deleted message IDs from tracking file."""
+    if DELETED_FILE.exists():
+        with open(DELETED_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_deleted(deleted_ids):
+    """Save set of deleted message IDs to tracking file."""
+    with open(DELETED_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(deleted_ids), f)
 
 
 def load_channels():
     """Load all channels from the local Discord data package."""
     messages_dir = PACKAGE_PATH / "Messages"
+    deleted_ids = load_deleted()
 
     # Load display name index
     with open(messages_dir / "index.json", encoding="utf-8") as f:
@@ -62,7 +78,7 @@ def load_channels():
             category = "Other"
             display_name = raw_name
 
-        message_ids = [str(m["ID"]) for m in msgs]
+        message_ids = [str(m["ID"]) for m in msgs if str(m["ID"]) not in deleted_ids]
         channels.append({
             "id": cid,
             "type": ctype,
@@ -144,6 +160,17 @@ class DiscordDeleterApp:
         self.progress_label = tk.StringVar(value="")
         ttk.Label(status_frame, textvariable=self.progress_label).pack(fill="x")
 
+        # Log area
+        log_frame = ttk.LabelFrame(self.root, text="Log", padding=4)
+        log_frame.pack(fill="x", padx=10, pady=5)
+
+        self.log_text = tk.Text(log_frame, height=6, state="disabled", wrap="word",
+                                font=("Consolas", 9))
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        self.log_text.pack(side="left", fill="x", expand=True)
+        log_scrollbar.pack(side="right", fill="y")
+
         # Action buttons
         action_frame = ttk.Frame(self.root)
         action_frame.pack(fill="x", padx=10, pady=(5, 10))
@@ -153,6 +180,15 @@ class DiscordDeleterApp:
 
         self.stop_btn = ttk.Button(action_frame, text="Stop", command=self._stop_deletion, state="disabled")
         self.stop_btn.pack(side="left")
+
+    def _log(self, msg):
+        """Append a line to the log area. Thread-safe via root.after."""
+        def _append():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        self.root.after(0, _append)
 
     def _toggle_token(self):
         self.show_token = not self.show_token
@@ -243,12 +279,14 @@ class DiscordDeleterApp:
         headers = {"Authorization": token}
         deleted = 0
         errors = 0
+        deleted_ids = load_deleted()
 
         for ch in selected_channels:
             if not self.is_running:
                 break
 
             cid = ch["id"]
+            self._log(f"--- {ch['display_name']} ({ch['message_count']} msgs) ---")
             self.root.after(0, self.status_var.set, f"Deleting in: {ch['display_name']}")
 
             for mid in ch["message_ids"]:
@@ -261,23 +299,32 @@ class DiscordDeleterApp:
 
                     if resp.status_code == 429:
                         retry_after = resp.json().get("retry_after", 5)
+                        self._log(f"  Rate limited, waiting {retry_after:.1f}s...")
                         self.root.after(0, self.status_var.set, f"Rate limited, waiting {retry_after:.1f}s...")
                         time.sleep(retry_after + 0.1)
-                        # Retry this message
                         resp = requests.delete(url, headers=headers, timeout=10)
 
                     if resp.status_code in (200, 204):
                         deleted += 1
+                        deleted_ids.add(mid)
+                        save_deleted(deleted_ids)
+                        self._log(f"  Deleted {mid}")
                     elif resp.status_code in (403, 404):
-                        deleted += 1  # Count as handled (already gone or no permission)
+                        deleted += 1
+                        deleted_ids.add(mid)
+                        save_deleted(deleted_ids)
+                        self._log(f"  Skipped {mid} ({resp.status_code})")
                     else:
                         errors += 1
+                        self._log(f"  FAILED {mid} (HTTP {resp.status_code})")
                         if resp.status_code == 401:
+                            self._log("  Invalid token! Stopping.")
                             self.root.after(0, self.status_var.set, "Invalid token!")
                             self.is_running = False
                             break
                 except requests.RequestException as e:
                     errors += 1
+                    self._log(f"  ERROR {mid}: {e}")
 
                 self.root.after(0, self._update_progress, deleted, total_msgs, errors)
 
