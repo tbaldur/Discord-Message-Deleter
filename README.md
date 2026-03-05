@@ -20,6 +20,8 @@ Discord doesn't provide a way to bulk-delete your own messages. This tool reads 
 - Rate limit handling (respects Discord's 429 responses)
 - Stop button to cancel mid-deletion
 - No database, no config files — just run it
+- Tracks deleted messages in `deleted.json` — resume where you left off
+- Live log showing each deletion result (success, skipped, failed)
 
 ## Setup
 
@@ -70,6 +72,20 @@ The tool reads these files from your data package:
 | `Messages/c{id}/messages.json` | Your messages with IDs and timestamps |
 
 For each selected channel, it sends `DELETE` requests to Discord's API with a 1.4 second delay between each request to avoid rate limits. If rate limited (HTTP 429), it waits the required time before retrying.
+
+### Deletion tracking
+
+Successfully deleted messages are saved to `deleted.json` alongside the script. On next launch, those messages are filtered out so you only see what's left to delete. This means you can stop and resume at any time without re-deleting messages.
+
+To start fresh, just delete the `deleted.json` file.
+
+### Log
+
+The log panel shows real-time feedback for each message:
+- **Deleted** — successfully removed from Discord
+- **Skipped (403/404)** — message was already gone or inaccessible
+- **FAILED** — deletion failed (with HTTP status code)
+- **Rate limited** — waiting before retrying
 
 ## Disclaimer
 
