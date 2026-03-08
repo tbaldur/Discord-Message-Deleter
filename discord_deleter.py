@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -8,8 +9,12 @@ from pathlib import Path
 
 import requests
 
-PACKAGE_PATH = Path(__file__).parent / "package"
-DELETED_FILE = Path(__file__).parent / "deleted.json"
+# When running as a PyInstaller exe, sys.executable is the exe path.
+# When running as a script, __file__ is the script path.
+_BASE_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+PACKAGE_PATH = _BASE_DIR / "package"
+DELETED_FILE = _BASE_DIR / "deleted.json"
+DISCOVERED_FILE = _BASE_DIR / "discovered.json"
 API_BASE = "https://discord.com/api/v9"
 DELETE_DELAY = 1.4  # seconds between deletes
 
@@ -26,6 +31,20 @@ def save_deleted(deleted_ids):
     """Save set of deleted message IDs to tracking file."""
     with open(DELETED_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(deleted_ids), f)
+
+
+def load_discovered():
+    """Load discovered channels/messages. Returns dict: {channel_id: {display_name, category, message_ids[]}}."""
+    if DISCOVERED_FILE.exists():
+        with open(DISCOVERED_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_discovered(data):
+    """Save discovered channels/messages."""
+    with open(DISCOVERED_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 def load_channels():
@@ -88,6 +107,36 @@ def load_channels():
             "message_count": len(message_ids),
         })
 
+    # Merge in discovered channels/messages
+    discovered = load_discovered()
+    package_channel_ids = {ch["id"] for ch in channels}
+    package_msg_lookup = {ch["id"]: set(ch["message_ids"]) for ch in channels}
+
+    for cid, dch in discovered.items():
+        disc_mids = [mid for mid in dch["message_ids"] if mid not in deleted_ids]
+        if cid in package_channel_ids:
+            # Add new message IDs to existing channel
+            for ch in channels:
+                if ch["id"] == cid:
+                    existing = set(ch["message_ids"])
+                    new_mids = [mid for mid in disc_mids if mid not in existing]
+                    if new_mids:
+                        ch["message_ids"].extend(new_mids)
+                        ch["message_count"] = len(ch["message_ids"])
+                    break
+        elif disc_mids:
+            # Brand new channel not in package
+            channels.append({
+                "id": cid,
+                "type": dch.get("type", ""),
+                "display_name": dch["display_name"],
+                "category": dch["category"],
+                "message_ids": disc_mids,
+                "message_count": len(disc_mids),
+            })
+
+    # Remove channels with 0 messages after filtering
+    channels = [ch for ch in channels if ch["message_count"] > 0]
     channels.sort(key=lambda c: (c["category"], c["display_name"].lower()))
     return channels
 
@@ -181,6 +230,12 @@ class DiscordDeleterApp:
         self.stop_btn = ttk.Button(action_frame, text="Stop", command=self._stop_deletion, state="disabled")
         self.stop_btn.pack(side="left")
 
+        self.discover_btn = ttk.Button(action_frame, text="Discover New", command=self._start_discover)
+        self.discover_btn.pack(side="right")
+
+        self.refresh_btn = ttk.Button(action_frame, text="Refresh via API", command=self._start_refresh)
+        self.refresh_btn.pack(side="right", padx=(0, 5))
+
     def _log(self, msg):
         """Append a line to the log area. Thread-safe via root.after."""
         def _append():
@@ -262,18 +317,303 @@ class DiscordDeleterApp:
             return
 
         self.is_running = True
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self._set_buttons(True)
         self.progress["value"] = 0
         self.progress["maximum"] = total_msgs
 
         thread = threading.Thread(target=self._delete_worker, args=(token, selected, total_msgs), daemon=True)
         thread.start()
 
+    def _set_buttons(self, running):
+        """Enable/disable buttons based on whether a task is running."""
+        state_on = "normal" if not running else "disabled"
+        self.start_btn.configure(state=state_on)
+        self.refresh_btn.configure(state=state_on)
+        self.discover_btn.configure(state=state_on)
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
     def _stop_deletion(self):
         self.is_running = False
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Stopping...")
+
+    def _start_refresh(self):
+        token = self.token_var.get().strip()
+        if not token:
+            messagebox.showwarning("Token Required", "Please enter your Discord auth token.")
+            return
+
+        selected = [ch for ch in self.channels if self.channel_vars.get(ch["id"], tk.BooleanVar()).get()]
+        if not selected:
+            messagebox.showwarning("No Channels", "Please select at least one channel to check.")
+            return
+
+        total_msgs = sum(ch["message_count"] for ch in selected)
+        self.is_running = True
+        self._set_buttons(True)
+        self.progress["value"] = 0
+        self.progress["maximum"] = total_msgs
+
+        thread = threading.Thread(target=self._refresh_worker, args=(token, selected, total_msgs), daemon=True)
+        thread.start()
+
+    def _start_discover(self):
+        token = self.token_var.get().strip()
+        if not token:
+            messagebox.showwarning("Token Required", "Please enter your Discord auth token.")
+            return
+
+        self.is_running = True
+        self._set_buttons(True)
+        self.progress["value"] = 0
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(20)
+
+        thread = threading.Thread(target=self._discover_worker, args=(token,), daemon=True)
+        thread.start()
+
+    def _api_get(self, url, headers):
+        """GET with rate limit handling. Returns response or None."""
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 429:
+            retry_after = resp.json().get("retry_after", 5)
+            self._log(f"  Rate limited, waiting {retry_after:.1f}s...")
+            time.sleep(retry_after + 0.1)
+            resp = requests.get(url, headers=headers, timeout=15)
+        return resp
+
+    def _fetch_user_messages(self, cid, user_id, headers):
+        """Paginate through a channel and return list of message IDs authored by user_id."""
+        message_ids = []
+        before = None
+        while self.is_running:
+            url = f"{API_BASE}/channels/{cid}/messages?limit=100"
+            if before:
+                url += f"&before={before}"
+            try:
+                resp = self._api_get(url, headers)
+                if resp.status_code in (403, 404):
+                    break  # Can't access this channel
+                if resp.status_code == 401:
+                    self.is_running = False
+                    break
+                if resp.status_code != 200:
+                    break
+                msgs = resp.json()
+                if not msgs:
+                    break
+                for m in msgs:
+                    if m["author"]["id"] == user_id:
+                        message_ids.append(m["id"])
+                before = msgs[-1]["id"]
+                time.sleep(0.5)
+            except requests.RequestException:
+                break
+        return message_ids
+
+    def _discover_worker(self, token):
+        """Discover new channels and messages via the Discord API."""
+        headers = {"Authorization": token}
+        discovered = load_discovered()
+        deleted_ids = load_deleted()
+        known_msg_ids = set()
+        for ch in self.channels:
+            known_msg_ids.update(ch["message_ids"])
+        for dch in discovered.values():
+            known_msg_ids.update(dch["message_ids"])
+
+        # Get user ID
+        self._log("Fetching user info...")
+        try:
+            resp = self._api_get(f"{API_BASE}/users/@me", headers)
+            if resp.status_code != 200:
+                self._log(f"Failed to get user info (HTTP {resp.status_code})")
+                self.root.after(0, self._finish_discover, 0, 0)
+                return
+            user_id = resp.json()["id"]
+            self._log(f"User ID: {user_id}")
+        except requests.RequestException as e:
+            self._log(f"Error: {e}")
+            self.root.after(0, self._finish_discover, 0, 0)
+            return
+
+        # Collect all channels to scan
+        api_channels = []  # list of (id, display_name, category)
+
+        # DMs and Group DMs
+        self._log("Fetching DM channels...")
+        try:
+            resp = self._api_get(f"{API_BASE}/users/@me/channels", headers)
+            if resp.status_code == 200:
+                for ch in resp.json():
+                    cid = ch["id"]
+                    ch_type = ch.get("type", 0)
+                    if ch_type == 1:  # DM
+                        recip = ch.get("recipients", [{}])[0]
+                        name = recip.get("username", "Unknown")
+                        api_channels.append((cid, name, "Direct Messages"))
+                    elif ch_type == 3:  # GROUP_DM
+                        name = ch.get("name") or f"Group ({cid})"
+                        api_channels.append((cid, name, "Group DMs"))
+                self._log(f"  Found {len(api_channels)} DM/group channels")
+            time.sleep(0.5)
+        except requests.RequestException as e:
+            self._log(f"  Error fetching DMs: {e}")
+
+        # Guilds and their channels
+        self._log("Fetching servers...")
+        try:
+            resp = self._api_get(f"{API_BASE}/users/@me/guilds", headers)
+            if resp.status_code == 200:
+                guilds = resp.json()
+                self._log(f"  Found {len(guilds)} servers")
+                for guild in guilds:
+                    if not self.is_running:
+                        break
+                    gid = guild["id"]
+                    gname = guild["name"]
+                    time.sleep(0.5)
+                    try:
+                        resp2 = self._api_get(f"{API_BASE}/guilds/{gid}/channels", headers)
+                        if resp2.status_code == 200:
+                            for gch in resp2.json():
+                                # type 0=text, 5=announcement
+                                if gch.get("type", 0) in (0, 5):
+                                    api_channels.append((gch["id"], gch.get("name", "unknown"), gname))
+                    except requests.RequestException:
+                        self._log(f"  Could not fetch channels for {gname}")
+        except requests.RequestException as e:
+            self._log(f"  Error fetching servers: {e}")
+
+        self._log(f"Total channels to scan: {len(api_channels)}")
+
+        # Switch progress to determinate
+        self.root.after(0, self._set_discover_progress, len(api_channels))
+
+        # Scan each channel for user's messages
+        new_channels = 0
+        new_messages = 0
+        for i, (cid, name, category) in enumerate(api_channels):
+            if not self.is_running:
+                break
+
+            self._log(f"Scanning: {name} ({category})")
+            self.root.after(0, self.status_var.set, f"Scanning: {name}")
+
+            msg_ids = self._fetch_user_messages(cid, user_id, headers)
+            # Filter out known and deleted
+            new_mids = [mid for mid in msg_ids if mid not in known_msg_ids and mid not in deleted_ids]
+
+            if new_mids:
+                new_messages += len(new_mids)
+                self._log(f"  Found {len(new_mids)} new messages")
+                known_msg_ids.update(new_mids)
+
+                # Save to discovered
+                if cid in discovered:
+                    existing = set(discovered[cid]["message_ids"])
+                    discovered[cid]["message_ids"].extend(m for m in new_mids if m not in existing)
+                else:
+                    new_channels += 1
+                    discovered[cid] = {
+                        "display_name": name,
+                        "category": category,
+                        "type": "DM" if category == "Direct Messages" else "GROUP_DM" if category == "Group DMs" else "GUILD_TEXT",
+                        "message_ids": new_mids,
+                    }
+                save_discovered(discovered)
+            else:
+                self._log(f"  No new messages")
+
+            self.root.after(0, self._update_progress, i + 1, len(api_channels), 0)
+            time.sleep(0.5)
+
+        self.root.after(0, self._finish_discover, new_channels, new_messages)
+
+    def _set_discover_progress(self, total):
+        self.progress.stop()
+        self.progress.configure(mode="determinate", maximum=total, value=0)
+
+    def _finish_discover(self, new_channels, new_messages):
+        self.is_running = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self._set_buttons(False)
+        msg = f"Discover done: {new_messages} new messages"
+        if new_channels:
+            msg += f", {new_channels} new channels"
+        self._log(msg)
+        self.status_var.set(msg)
+
+        if new_messages > 0:
+            if messagebox.askyesno("Reload", f"Found {new_messages} new messages. Reload channel list?"):
+                self._reload_channels()
+
+    def _reload_channels(self):
+        """Clear and rebuild the channel list."""
+        for widget in self.inner_frame.winfo_children():
+            widget.destroy()
+        self.channel_vars.clear()
+        self.channels.clear()
+        self._load_channels()
+
+    def _refresh_worker(self, token, selected_channels, total_msgs):
+        """Check selected channels via API — mark messages that are already gone."""
+        headers = {"Authorization": token}
+        checked = 0
+        newly_deleted = 0
+        still_exist = 0
+        deleted_ids = load_deleted()
+
+        for ch in selected_channels:
+            if not self.is_running:
+                break
+
+            cid = ch["id"]
+            self._log(f"--- Checking: {ch['display_name']} ({ch['message_count']} msgs) ---")
+            self.root.after(0, self.status_var.set, f"Checking: {ch['display_name']}")
+
+            for mid in ch["message_ids"]:
+                if not self.is_running:
+                    break
+
+                url = f"{API_BASE}/channels/{cid}/messages/{mid}"
+                try:
+                    resp = requests.get(url, headers=headers, timeout=10)
+
+                    if resp.status_code == 429:
+                        retry_after = resp.json().get("retry_after", 5)
+                        self._log(f"  Rate limited, waiting {retry_after:.1f}s...")
+                        time.sleep(retry_after + 0.1)
+                        resp = requests.get(url, headers=headers, timeout=10)
+
+                    if resp.status_code == 200:
+                        still_exist += 1
+                        self._log(f"  Exists {mid}")
+                    elif resp.status_code in (404, 403):
+                        newly_deleted += 1
+                        deleted_ids.add(mid)
+                        save_deleted(deleted_ids)
+                        self._log(f"  Gone {mid}")
+                    elif resp.status_code == 401:
+                        self._log("  Invalid token! Stopping.")
+                        self.root.after(0, self.status_var.set, "Invalid token!")
+                        self.is_running = False
+                        break
+                except requests.RequestException as e:
+                    self._log(f"  ERROR {mid}: {e}")
+
+                checked += 1
+                self.root.after(0, self._update_progress, checked, total_msgs, 0)
+
+                if self.is_running:
+                    time.sleep(0.5)
+
+        self.is_running = False
+        self._log(f"Refresh done: {still_exist} still exist, {newly_deleted} already gone")
+        self.root.after(0, self.status_var.set,
+                        f"Refresh done: {still_exist} still exist, {newly_deleted} marked as deleted")
+        self.root.after(0, self._set_buttons, False)
 
     def _delete_worker(self, token, selected_channels, total_msgs):
         headers = {"Authorization": token}
@@ -336,8 +676,7 @@ class DiscordDeleterApp:
         if errors:
             final_msg += f" ({errors} errors)"
         self.root.after(0, self.status_var.set, final_msg)
-        self.root.after(0, self.start_btn.configure, {"state": "normal"})
-        self.root.after(0, self.stop_btn.configure, {"state": "disabled"})
+        self.root.after(0, self._set_buttons, False)
 
     def _update_progress(self, deleted, total, errors):
         self.progress["value"] = deleted
