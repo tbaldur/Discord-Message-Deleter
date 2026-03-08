@@ -8,7 +8,8 @@ A Python GUI tool to bulk-delete your Discord messages. Uses your Discord data p
 
 Discord doesn't provide a way to bulk-delete your own messages. This tool reads message IDs from your local data export and can also scan the Discord API to discover messages sent after the export, so you always have a complete picture of what to delete.
 
-<img width="615" height="863" alt="image" src="https://github.com/user-attachments/assets/7ba7beb6-0772-489c-9887-4baf5996080a" />
+<img width="651" height="930" alt="image" src="https://github.com/user-attachments/assets/a3fd7037-2f21-4ac1-b167-21b36bef9247" />
+
 
 
 ## Features
