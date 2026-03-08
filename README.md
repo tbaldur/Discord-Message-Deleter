@@ -1,12 +1,12 @@
 # Discord Message Deleter
 
-A Python GUI tool to bulk-delete your Discord messages. Uses your Discord data package (GDPR export) to find message IDs, then deletes them via the Discord API.
+A Python GUI tool to bulk-delete your Discord messages. Uses your Discord data package (GDPR export) to find message IDs, and can also discover new messages directly from the Discord API
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 
 ## Why?
 
-Discord doesn't provide a way to bulk-delete your own messages. This tool reads the message IDs from your local data export so it doesn't need to search the API — it already knows every message you've sent.
+Discord doesn't provide a way to bulk-delete your own messages. This tool reads message IDs from your local data export and can also scan the Discord API to discover messages sent after the export, so you always have a complete picture of what to delete.
 
 <img width="615" height="863" alt="image" src="https://github.com/user-attachments/assets/7ba7beb6-0772-489c-9887-4baf5996080a" />
 
@@ -19,8 +19,9 @@ Discord doesn't provide a way to bulk-delete your own messages. This tool reads 
 - Progress bar with live status updates
 - Rate limit handling (respects Discord's 429 responses)
 - Stop button to cancel mid-deletion
-- No database, no config files — just run it
 - Tracks deleted messages in `deleted.json` — resume where you left off
+- **Refresh via API** — check which messages still exist on Discord and update tracking
+- **Discover New** — scan Discord for messages sent after your data export
 - Live log showing each deletion result (success, skipped, failed)
 
 ## Setup
@@ -46,12 +47,27 @@ Discord doesn't provide a way to bulk-delete your own messages. This tool reads 
 
 ### 3. Install and run
 
+**Option A: Standalone exe (no Python needed)**
+
+Download `DiscordDeleter.exe` from the [Releases](../../releases) page. Place it in a folder alongside your `package/` directory and run it.
+
+**Option B: Run from source**
+
 ```bash
 pip install requests
 python discord_deleter.py
 ```
 
-Place the `package/` folder in the same directory as `discord_deleter.py`, or edit the `PACKAGE_PATH` at the top of the script.
+Your folder should look like this:
+
+```
+discord_deleter/
+  DiscordDeleter.exe    (or discord_deleter.py)
+  package/
+    Messages/
+    Servers/
+    Account/
+```
 
 ## Usage
 
@@ -79,6 +95,16 @@ Successfully deleted messages are saved to `deleted.json` alongside the script. 
 
 To start fresh, just delete the `deleted.json` file.
 
+### Refresh via API
+
+If you deleted messages outside this tool (e.g. via a browser script), click **Refresh via API** to sync up. It checks each selected message against the Discord API — messages that return 404 are marked as deleted in the tracking file. This uses a 0.5s delay between checks since it's read-only.
+
+### Discover New
+
+Click **Discover New** to find messages sent after your data export. It scans your current Discord DMs, group DMs, and server channels via the API, and adds any new messages to the channel list. Discovered data is saved to `discovered.json` so it persists across restarts.
+
+**Limitations:** Only finds channels you currently have access to — open DMs, active group DMs, and servers you're still in. Messages from closed DMs or servers you've left can only come from the data package.
+
 ### Log
 
 The log panel shows real-time feedback for each message:
@@ -86,6 +112,17 @@ The log panel shows real-time feedback for each message:
 - **Skipped (403/404)** — message was already gone or inaccessible
 - **FAILED** — deletion failed (with HTTP status code)
 - **Rate limited** — waiting before retrying
+
+### Data files
+
+The tool creates these files next to the exe/script:
+
+| File | Purpose |
+|------|---------|
+| `deleted.json` | Message IDs that have been deleted — prevents re-processing |
+| `discovered.json` | Messages found via Discover New that aren't in the data package |
+
+Delete either file to reset that tracking.
 
 ## Disclaimer
 
